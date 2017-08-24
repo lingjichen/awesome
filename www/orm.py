@@ -27,20 +27,19 @@ import asyncio, logging
 # pip2 install aiomysql
 import aiomysql
 
-
+logging.basicConfig(level=logging.INFO)
 # 打印SQL查询语句
 def log(sql, args=()):
     logging.info('SQL: %s' % (sql))
 
 
 # 创建一个全局的连接池，每个HTTP请求都从池中获得数据库连接
-@asyncio.coroutine
-def create_pool(loop, **kw):
+async def create_pool(loop, **kw):
     logging.info('create database connection pool...')
 
     # 全局变量__pool用于存储整个连接池
     global __pool
-    __pool = yield from aiomysql.create_pool(
+    __pool = await aiomysql.create_pool(
         # **kw参数可以包含所有连接需要用到的关键字参数
         # 默认本机IP
         host=kw.get('host', 'localhost'),
@@ -60,29 +59,29 @@ def create_pool(loop, **kw):
 
 
 # 封装SQL SELECT语句为select函数
-def select(sql, args, size=None):
+async def select(sql, args, size=None):
     log(sql, args)
     global __pool
 
     # -*- yield from 将会调用一个子协程，并直接返回调用的结果
     # yield from从连接池中返回一个连接
-    with (yield from __pool) as conn:
+    async with __pool.get() as conn:
         # DictCursor is a cursor which returns results as a dictionary
-        cur = yield from conn.cursor(aiomysql.DictCursor)
+        async with conn.cursor(aiomysql.DictCursor) as cur:
 
-        # 执行SQL语句
-        # SQL语句的占位符为?，MySQL的占位符为%s
-        yield from cur.execute(sql.replace('?', '%s'), args or ())
+            # 执行SQL语句
+            # SQL语句的占位符为?，MySQL的占位符为%s
+            await cur.execute(sql.replace('?', '%s'), args or ())
 
-        # 根据指定返回的size，返回查询的结果
-        if size:
-            # 返回size条查询结果
-            rs = fetchmany(size)
-        else:
-            # 返回所有查询结果
-            rs = fetchall()
+            # 根据指定返回的size，返回查询的结果
+            if size:
+                # 返回size条查询结果
+                rs = await cur.fetchmany(size)
+            else:
+                # 返回所有查询结果
+                rs = await cur.fetchall()
 
-        yield from cur.close()
+
         logging.info('rows return: %s' % (len(rs)))
         return rs
 
@@ -90,20 +89,26 @@ def select(sql, args, size=None):
 # 封装INSERT, UPDATE, DELETE
 # 语句操作参数一样，所以定义一个通用的执行函数
 # 返回操作影响的行号
-@asyncio.coroutine
-def execute(sql, args):
+async def execute(sql, args, autocommit=True):
     log(sql, args)
-    global __pool
-    with (yield from __pool) as conn:
+    async with  __pool.get() as conn:
+        if not autocommit:
+            await conn.begin()
         try:
             # execute类型的SQL操作返回的结果只有行号，所以不需要用DictCursor
-            cur = yield from conn.cursor()
-            cur.execute(sql.replace('?', '%s'), args)
-            affectedLine = cur.rowcount
-            yield from cur.close()
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(sql.replace('?', '%s'), args)
+                affected = cur.rowcount
+                await cur.close()
+            if not autocommit:
+                await conn.commit()
         except BaseException as e:
-            raise
-        return affectedLine
+            if not autocommit:
+                await conn.rollback()
+            raise e
+        finally:
+            conn.close()
+        return affected
 
 
 # 根据输入的参数生成占位符列表
@@ -113,7 +118,7 @@ def create_args_string(num):
         L.append('?')
 
     # 以','为分隔符，将列表合成字符串
-    return (','.join(L))
+    return ', '.join(L)
 
 
 # 定义Field类，负责保存(数据库)表的字段名和字段类型
@@ -134,14 +139,14 @@ class Field(object):
 # -*- 表的不同列的字段的类型不一样
 
 class StringField(Field):
-    def __init__(self, name=None, primary_key=False, default=None, column_type='varchar(100)'):
-        super().__init__(name, column_type, primary_key, default)
+    def __init__(self, name=None, primary_key=False, default=None, ddl='varchar(100)'):
+        super().__init__(name, ddl, primary_key, default)
 
 
 class BooleanField(Field):
-    def __init__(self, name=None, default=None):
+    def __init__(self, name=None, default=False):
         super().__init__(name, 'boolean', False, default)
-
+        #这里出现过错误，default=None会出现cloumn 'admin' cannot be Null
 
 class IntegerField(Field):
     def __init__(self, name=None, primary_key=False, default=0):
@@ -155,7 +160,7 @@ class FloatField(Field):
 
 class TextField(Field):
     def __init__(self, name=None, default=None):
-        super().__init__(name, 'Text', False, default)
+        super().__init__(name, 'text', False, default)
 
 
 # -*-定义Model的元类
@@ -231,10 +236,8 @@ class ModelMetaclass(type):
         # 构造默认的SELECT、INSERT、UPDATE、DELETE语句
         # ``反引号功能同repr()
         attrs['__select__'] = 'select `%s`, %s from `%s`' % (primaryKey, ', '.join(escaped_fields), tableName)
-        attrs['__insert__'] = 'insert into  `%s` (%s, `%s`) values(%s)' % (
-        tableName, ', '.join(escaped_fields), primaryKey, create_args_string(len(escaped_fields) + 1))
-        attrs['__update__'] = 'update `%s` set `%s` where `%s` = ?' % (
-        tableName, ', '.join(map(lambda f: '`%s`=?' % (mappings.get(f).name or f), fields)), primaryKey)
+        attrs['__insert__'] = 'insert into  `%s` (%s, `%s`) values (%s)' % (tableName, ', '.join(escaped_fields), primaryKey, create_args_string(len(escaped_fields) + 1))
+        attrs['__update__'] = 'update `%s` set %s where `%s` = ?' % (tableName, ', '.join(map(lambda f: '`%s`=?' % (mappings.get(f).name or f), fields)), primaryKey)
         attrs['__delete__'] = 'delete from  `%s` where `%s`=?' % (tableName, primaryKey)
 
         return type.__new__(cls, name, bases, attrs)
@@ -278,8 +281,7 @@ class Model(dict, metaclass=ModelMetaclass):
 
     @classmethod
     # 类方法有类变量cls传入，从而可以用cls做一些相关的处理。并且有子类继承时，调用该类方法时，传入的类变量cls是子类，而非父类。
-    @asyncio.coroutine
-    def findAll(cls, where=None, args=None, **kw):
+    async def findAll(cls, where=None, args=None, **kw):
         '''find objects by where clause'''
         sql = [cls.__select__]
 
@@ -306,51 +308,46 @@ class Model(dict, metaclass=ModelMetaclass):
                 args.extend(limit)
             else:
                 raise ValueError('Invalid limit value: %s' % str(limit))
-        rs = yield from select(' '.join(sql), args)
+        rs = await select(' '.join(sql), args)
         return [cls(**r) for r in rs]
 
     @classmethod
-    @asyncio.coroutine
-    def findNumber(cls, selectField, where=None, args=None):
+    async def findNumber(cls, selectField, where=None, args=None):
         '''find number by select and where.'''
         sql = ['select %s __num__ from `%s`' % (selectField, cls.__table__)]
         if where:
             sql.append('where')
             sql.append(where)
-        rs = yield from select(' '.join(sql), args, 1)
+        rs = await select(' '.join(sql), args, 1)
         if len(rs) == 0:
             return None
         return rs[0]['__num__']
 
     @classmethod
-    @asyncio.coroutine
-    def find(cls, primarykey):
+    async def find(cls, primarykey):
         '''find object by primary key'''
-        rs = yield from select('%s where `%s`=?' % (cls.__select__, cls__primary_key__), [primarykey], 1)
+        rs = await select('%s where `%s`=?' % (cls.__select__, cls.__primary_key__), [primarykey], 1)
         if len(rs) == 0:
             return None
         return cls(**rs[0])
 
-    @asyncio.coroutine
-    def save(self):
+    async def save(self):
         args = list(map(self.getValueOrDefault, self.__fields__))
         args.append(self.getValueOrDefault(self.__primary_key__))
-        rows = yield from execute(self.__insert__, args)
+        rows = await execute(self.__insert__, args)
         if rows != 1:
             logging.warn('failed to insert record: affected rows: %s' % rows)
 
-    @asyncio.coroutine
-    def update(self):
+    async def update(self):
         args = list(map(self.getValue, self.__fields__))
         args.append(self.getValue(self.__primary_key__))
-        rows = yield from execute(self.__updata__, args)
+        rows = await execute(self.__updata__, args)
         if rows != 1:
             logging.warn('failed to update by primary key: affected rows: %s' % rows)
 
-    @asyncio.coroutine
-    def remove(self):
+    async def remove(self):
         args = [self.getValue(self.__primary_key__)]
-        rows = yield from execute(self.__updata__, args)
+        rows = await execute(self.__updata__, args)
         if rows != 1:
             logging.warn('failed to remove by primary key: affected rows: %s' % rows)
 
